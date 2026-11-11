@@ -51,7 +51,7 @@ INFERA_FEE_HUNDREDTHS_OF_BIP = "20000"  # 2% on buys and sells, on top of Progra
 DESCRIPTION = "Inference infrastructure to power agents at scale."
 IMAGE_PATH = "assets/infera-logo.jpg"
 LINKS = [
-    {"kind": "website", "uri": "https://inferacompute.xyz"},
+    {"kind": "website", "uri": "https://inferacompute.xyz/"},
     {"kind": "x", "uri": "https://x.com/inferaHQ_"},
 ]
 
