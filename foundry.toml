@@ -1,0 +1,24 @@
+# Foundry configuration for the INFERA/ETH Uniswap v4 hook (contracts/).
+# `deny = "warnings"` makes the build fail on any compiler or lint warning in src/.
+
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc = "0.8.26"
+optimizer = true
+optimizer_runs = 10_000
+via_ir = false
+evm_version = "cancun"
+deny = "warnings"
+bytecode_hash = "none"
+cbor_metadata = false
+
+[lint]
+# Tests and vendored libraries are not part of the submitted contracts.
+ignore = ["test/**/*.sol", "script/**/*.sol", "lib/**/*.sol"]
+
+[profile.default.fuzz]
+runs = 256
