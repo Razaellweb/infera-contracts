@@ -3,7 +3,9 @@
 
 Compiles the token, hook and initializer with the exact compiler Programmable admits
 (solc 0.8.26+commit.8a97fa7a), writes the Standard JSON input and artifacts, and writes
-`programmable-launch.config.json` (profile 3.6.0) for `programmable-launch pack`.
+`programmable-launch.config.json` for `programmable-launch pack`. The config pins no profile
+version: `pack` then reads Programmable's live capabilities and binds the active profile (3.6.0)
+and its live platform fee policy (0.3% to 0xD885...79da).
 
 Run it from a clean checkout of the public commit being submitted, right before packing:
 the permit window it writes is valid for one hour.
@@ -184,7 +186,6 @@ def main():
     now = int(time.time())
     config = {
         "schemaVersion": "programmable.launch-pack-config.v3",
-        "profileVersion": "3.6.0",
         "launchWallet": LAUNCH_WALLET,
         "chainId": "1",
         "nonce": "0x" + secrets.token_hex(32),
