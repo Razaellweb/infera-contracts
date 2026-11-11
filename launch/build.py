@@ -314,7 +314,7 @@ def main():
         "permitWindow": {"validAfter": str(now - 60), "deadline": str(now + 3_540)},
         "agentAttestation": {
             "agentId": "infera-launch-build",
-            "checkedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "checkedAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now)),
             "checks": [
                 {"checkId": "foundry-test-suite", "evidence": "launch/build/evidence/forge-test.txt"},
                 {"checkId": "mainnet-fork-launch", "evidence": "launch/build/evidence/fork-test.txt"},
