@@ -15,6 +15,8 @@ evm_version = "cancun"
 deny = "warnings"
 bytecode_hash = "none"
 cbor_metadata = false
+# The package rehearsal test reads the generated launch package.
+fs_permissions = [{ access = "read", path = "./launch/build" }, { access = "read", path = "./programmable-launch.config.json" }]
 
 [lint]
 # Tests and vendored libraries are not part of the submitted contracts.

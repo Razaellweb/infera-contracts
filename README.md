@@ -89,33 +89,54 @@ This is same-block price enforcement, not complete MEV protection:
 - Fees are charged on the price-enforced ETH leg, so Programmable's 0.3% and Infera's 2% are paid on
   what actually leaves or enters the pool.
 
+## Launch protection
+
+Programmable requires these rules of every new Ethereum launch. They run from the launch block
+(`InferaToken.startedAt`):
+
+| Rule | Where | For how long |
+| --- | --- | --- |
+| Before the launch, the only possible transfer is the initializer seeding the pool | `InferaToken` | until `start()` |
+| Each address can **receive** at most 2% of supply in total (sells, forwarding and burning never restore it; transfers into the PoolManager don't count; no address is exempt) | `InferaToken` | first 300 seconds |
+| Buys must come through the canonical Universal Router (`0xd92A…446C`, code hash pinned), which identifies the buyer, or be the initializer's first buy (the developer's). Any other router's buy reverts | `InferaEthHook` | first 300 seconds |
+| Each **buyer** can buy at most 2% of supply in total, wherever the tokens are sent, including the developer and tax-exempt wallets | `InferaEthHook` | first 300 seconds |
+| Buys pay an opening tax on top of the normal 2.3%: the total buy fee starts at 99% and falls linearly to 2.3%. The developer (the launch wallet) and up to six fixed wallets (none configured) are exempt from the tax only. The tax is held in the hook, fully backed, and payable only to Programmable's treasury `0xD885…79da` (`releaseOpeningTax`, `releaseAll`) | `InferaEthHook` | first 30 seconds |
+| The opening valuation must be at least USD 15,000 at the live Chainlink ETH/USD price (`0x5f4e…8419`, code hash pinned, at most one hour old), or the launch reverts | `InferaLaunchInitializer` | at the launch |
+
+Sells are never restricted and never pay the opening tax. Programmable's 0.3% is unchanged.
+
 ## Other behaviour to know
 
 - **Rounding.** Programmable's 0.3% rounds up per trade, so on trades of a few hundred wei or less its
-  effective rate is above 0.3%. The total never exceeds the trade's ETH leg.
-- **Price-limited partial fills.** An exact-input buy that stops early at the trader's own price limit
-  still pays fees on the full amount specified: v4 lets a hook take ETH from an exact-input buy only
-  before the swap, when the fill size is unknown. Standard routers set no binding limit.
+  effective rate is above 0.3%. The total never exceeds the trade's ETH leg; a buy too small to pay
+  more than its fee (a few wei) reverts.
+- **Full fills only on the ETH side.** A swap whose ETH amount is specified (exact-input buy,
+  exact-output sell) must fill completely. One stopped early by the trader's own price limit reverts
+  rather than charge fees on ETH that never reached the pool. Standard routers set no binding limit.
 - **Largest single buy.** An exact-input buy's fee is taken from the PoolManager's ETH before the buyer
   settles, so it can be at most the native ETH the PoolManager holds (about 55,000 ETH on Mainnet on
   11 Nov 2026, i.e. buys up to roughly 2.4 million ETH). A larger buy reverts whole.
-- **PoolManager.** On Ethereum Mainnet the constructor accepts only the canonical PoolManager
-  `0x000000000004444c5dc75cB358380D2e3dE08A90`.
-- **Token.** INFERA must be a plain ERC-20. A token with a transfer tax makes payments into the pool
-  revert (tested), so it cannot corrupt the hook's accounting, but the pool would not work.
+- **PoolManager and router.** On Ethereum Mainnet the constructors accept only the canonical
+  PoolManager `0x000000000004444c5dc75cB358380D2e3dE08A90`, Universal Router and Chainlink feed.
+- **Token.** INFERA is a plain ERC-20 apart from the launch rules above. A token with a transfer tax
+  makes payments into the pool revert (tested), so it cannot corrupt the hook's accounting.
 
 ## Launch
 
-Programmable's Launch Stamp Router deploys the token, the hook and `InferaLaunchInitializer` in one
+Programmable's Launch Stamp Router deploys the initializer, the token and the hook in one
 transaction, then its graph factory (the initializer's only allowed caller) calls `initialize` once,
 with the launch wallet's first-buy ETH:
 
-1. The pool is initialized at the starting tick: 187,320, about 136.4 million INFERA per ETH, a
-   USD 15,087 fully diluted valuation at USD 2,057.77/ETH (11 Nov 2026).
+1. The opening price is checked against the live ETH/USD feed: the valuation must be at least
+   USD 15,000. `launch/build.py` sets the opening tick for USD 20,000 at the ETH price when the package
+   is built, so the launch still clears the floor if ETH falls up to 25% before it happens (review plus
+   the 24-hour signing window).
 2. The whole supply goes into one position from the lowest usable price up to the starting price, so
    the pool opens holding only INFERA and buyers' ETH builds the other side.
-3. The launch wallet's first buy (USD 10 of ETH) runs through the hook and pays its fees like any
-   other buy. It reverts the whole launch if it returns less than its reviewed minimum.
+3. Trading starts on the token, which opens the protection window.
+4. The launch wallet's first buy (USD 10 of ETH) runs through the hook, pays the normal fees (no
+   opening tax) and counts toward its 2%. It reverts the whole launch if it returns less than its
+   reviewed minimum.
 
 The position is **locked permanently**: the initializer owns it and has no function that removes
 liquidity. Its earnings (the pool's 0.30% LP fee, in ETH from buys and INFERA from sells) can be
@@ -126,16 +147,16 @@ collected by anyone with `collectPoolFees()`, and only go to the hook's current 
 | Path | Purpose |
 | --- | --- |
 | `src/InferaEthHook.sol` | The hook |
-| `src/InferaToken.sol` | The INFERA ERC-20: fixed 1,000,000,000 supply minted once to the initializer; no owner, minting, tax, pause or blocklist |
+| `src/InferaToken.sol` | The INFERA ERC-20: fixed 1,000,000,000 supply minted once to the initializer; no owner, minting, tax, pause or blocklist; the 2% receiving limit for 300 seconds |
 | `src/InferaLaunchInitializer.sol` | Opens the pool in the launch transaction (see Launch) |
 | `src/InferaEthConfig.sol` | Ethereum Mainnet values: PoolManager, pool parameters, recipients, permission bits |
 | `src/utils/HookMiner.sol` | Finds a CREATE2 salt for an address carrying exactly the hook's permission bits (`0xCC`) |
-| `script/DeployInferaEthHook.s.sol` | Deploys the hook at a mined address (Mainnet, testnet or local node) |
-| `script/MineHookSalt.s.sol` | Prints a salt, the hook address and the init code for a given CREATE2 deployer |
-| `test/InferaEthHook.t.sol` | Tests against a real v4 PoolManager from v4-core, including the audit's adversarial cases |
-| `test/InferaLaunch.t.sol` | The full launch: seeding, locking, first buy, trading and pool-fee collection |
-| `test/InferaEthHook.invariant.t.sol` | Stateful fuzzing: random swaps, blocks, JIT liquidity, payouts and recipient changes, with the accounting invariants checked after every step |
-| `test/InferaEthHook.fork.t.sol` | Deploy script and swaps on the live Mainnet PoolManager; skipped without a fork |
+| `test/InferaEthHook.t.sol` | The hook against a real v4 PoolManager: fees, same-block price enforcement, payouts, owner controls and the audit's adversarial cases |
+| `test/InferaLaunch.t.sol` | The full launch and every launch-protection rule |
+| `test/InferaEthHook.invariant.t.sol` | Stateful fuzzing after launch (swaps, blocks, JIT liquidity, payouts, recipient changes) and during protection (router buys, sells, time crossing the 30- and 300-second marks), with the accounting, limit and tax invariants checked after every step |
+| `test/InferaEthHook.fork.t.sol` | The launch on a Mainnet fork with the live PoolManager, Chainlink feed and Universal Router |
+| `test/InferaLaunchPackage.fork.t.sol` | The exact packed Programmable request on a Mainnet fork, at the packer's predicted addresses |
+| `launch/` | The Programmable launch package (see `launch/README.md`) |
 
 Dependencies are pinned git submodules: `lib/forge-std` (v1.9.4) and `lib/v4-core` (`d153b048`).
 
@@ -149,7 +170,7 @@ git clone --recurse-submodules https://github.com/Razaellweb/infera-contracts
 cd infera-contracts
 forge build
 forge test
-forge test --match-path test/InferaEthHook.fork.t.sol --fork-url <ethereum-mainnet-rpc>
+forge test --match-path 'test/*.fork.t.sol' --fork-url <ethereum-mainnet-rpc>
 ```
 
 ## Launch on Programmable
@@ -158,14 +179,3 @@ The token, hook and initializer are submitted together as a Programmable Custom 
 Mainnet. `launch/` holds the packaging: it compiles the three contracts with the exact compiler and
 writes the Programmable launch config. Nothing in this repository holds a private key or an API key;
 the launch wallet signs the final transaction itself.
-
-## Deploying without Programmable (testnets)
-
-The scripts read no environment variables or key files. Pass the signer with Foundry's wallet options
-(`--account <keystore>`, `--ledger`, ...):
-
-```bash
-forge script script/DeployInferaEthHook.s.sol \
-  --sig "run(address,address,address)" <POOL_MANAGER> <INFERA_TOKEN> <OWNER> \
-  --rpc-url <rpc> --account <keystore> --broadcast
-```

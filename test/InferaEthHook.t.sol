@@ -18,6 +18,8 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 import {InferaEthHook} from "../src/InferaEthHook.sol";
+import {InferaToken} from "../src/InferaToken.sol";
+import {HookArgs, ProtectedRouterMock} from "./utils/LaunchFixtures.sol";
 import {InferaEthConfig} from "../src/InferaEthConfig.sol";
 import {HookMiner} from "../src/utils/HookMiner.sol";
 
@@ -63,8 +65,15 @@ contract ReentrantRecipient {
 /// A token that can switch on a 1% transfer tax, standing in for a non-standard INFERA.
 contract TaxableToken is MockERC20 {
     bool public taxOn;
+    address public immutable initializer;
+    address public immutable poolManager;
+    uint256 public constant startedAt = 1; // trading started long ago: no launch protection
+    uint256 public constant walletTokenLimit = type(uint256).max;
 
-    constructor() MockERC20("Taxed", "TAX", 18) {}
+    constructor(address initializer_, address poolManager_) MockERC20("Taxed", "TAX", 18) {
+        initializer = initializer_;
+        poolManager = poolManager_;
+    }
 
     function setTax(bool on) external {
         taxOn = on;
@@ -101,8 +110,10 @@ contract InferaEthHookTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
 
     InferaEthHook hook;
-    MockERC20 token;
+    InferaToken token;
     PoolKey poolKeyEthInfera;
+    ProtectedRouterMock protectedRouter;
+    address developer = makeAddr("developer");
 
     address owner = makeAddr("owner");
     address team = makeAddr("team");
@@ -117,18 +128,15 @@ contract InferaEthHookTest is Test, Deployers {
 
     function setUp() public {
         deployFreshManagerAndRouters();
-        token = new MockERC20("Infera", "INFERA", 18);
-        token.mint(address(this), 1_000_000 ether);
+        protectedRouter = new ProtectedRouterMock(manager);
+        // This test contract plays the launch initializer: it seeds the pool, then starts trading.
+        token = new InferaToken("Infera", "INFERA", 1e30, address(this), address(manager));
         token.approve(address(swapRouter), type(uint256).max);
         token.approve(address(modifyLiquidityRouter), type(uint256).max);
         vm.deal(address(this), 10_000 ether);
 
         address hookAddress = address(uint160(InferaEthConfig.HOOK_FLAGS) | (uint160(0x4444) << 144));
-        deployCodeTo(
-            "InferaEthHook.sol:InferaEthHook",
-            abi.encode(manager, address(token), uint24(3000), int24(60), owner, team, buybacks, compute),
-            hookAddress
-        );
+        deployCodeTo("InferaEthHook.sol:InferaEthHook", _hookArgs(address(token), 3000, 60), hookAddress);
         hook = InferaEthHook(payable(hookAddress));
         poolKeyEthInfera = hook.poolKey();
 
@@ -143,9 +151,27 @@ contract InferaEthHookTest is Test, Deployers {
             }),
             ZERO_BYTES
         );
+        // Start trading and move past the five-minute launch protection window: these tests cover
+        // normal trading. InferaLaunch.t.sol covers the protection rules.
+        token.start();
+        vm.warp(block.timestamp + 300);
     }
 
     // ------------------------------------------------------------ helpers
+
+    function _hookArgs(address token_, uint24 fee, int24 spacing) internal view returns (bytes memory) {
+        return HookArgs.encode(
+            manager,
+            token_,
+            fee,
+            spacing,
+            owner,
+            [team, buybacks, compute],
+            address(this),
+            developer,
+            address(protectedRouter)
+        );
+    }
 
     function _swap(bool buy, int256 amountSpecified, uint256 value) internal {
         swapRouter.swap{value: value}(
@@ -185,7 +211,7 @@ contract InferaEthHookTest is Test, Deployers {
     function _trader(string memory name) internal returns (address t) {
         t = makeAddr(name);
         vm.deal(t, 10_000 ether);
-        token.mint(t, 10_000 ether);
+        token.transfer(t, 10_000 ether);
         vm.prank(t);
         token.approve(address(swapRouter), type(uint256).max);
     }
@@ -215,7 +241,11 @@ contract InferaEthHookTest is Test, Deployers {
     }
 
     function _assertBacked() internal view {
-        assertEq(address(hook).balance, _sum(_accrued()), "accrued fees are exactly backed by the hook's ETH");
+        assertEq(
+            address(hook).balance,
+            _sum(_accrued()) + hook.openingTaxAccrued(),
+            "accrued fees and opening tax are exactly backed by the hook's ETH"
+        );
         assertEq(token.balanceOf(address(hook)), 0, "the hook never keeps INFERA");
         for (uint256 i; i < 4; ++i) {
             uint256 inflow = hook.collected(i) + (i == BUYBACKS ? hook.withheldEth() : 0);
@@ -394,7 +424,7 @@ contract InferaEthHookTest is Test, Deployers {
     /// final pool price.
     function _jitSandwichABuy() internal returns (int256 profitWei) {
         address attacker = _trader("jitAttacker");
-        token.mint(attacker, 100_000 ether);
+        token.transfer(attacker, 100_000 ether);
         vm.deal(attacker, 100_000 ether);
         vm.prank(attacker);
         token.approve(address(modifyLiquidityRouter), type(uint256).max);
@@ -467,59 +497,6 @@ contract InferaEthHookTest is Test, Deployers {
         assertEq(anchored, now_);
     }
 
-    /// A second hook/pool whose liquidity has a gap, so a capped swap can end with none in range.
-    function _gappedPool(int24 lower, int24 upper) internal returns (InferaEthHook gapped, PoolKey memory key) {
-        address at = address(uint160(InferaEthConfig.HOOK_FLAGS) | (uint160(0x6666) << 144));
-        deployCodeTo(
-            "InferaEthHook.sol:InferaEthHook",
-            abi.encode(manager, address(token), uint24(3000), int24(60), owner, team, buybacks, compute),
-            at
-        );
-        gapped = InferaEthHook(payable(at));
-        key = gapped.poolKey();
-        manager.initialize(key, SQRT_PRICE_1_1);
-        modifyLiquidityRouter.modifyLiquidity{value: 100 ether}(
-            key,
-            ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 100 ether, salt: 0}),
-            ZERO_BYTES
-        );
-        modifyLiquidityRouter.modifyLiquidity{value: 100 ether}(
-            key,
-            ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: 100 ether, salt: 0}),
-            ZERO_BYTES
-        );
-    }
-
-    function test_withNoLiquidityInRange_withheldInferaGoesToTheBuybacksRecipient() public {
-        (InferaEthHook gapped, PoolKey memory key) = _gappedPool(1200, 1800);
-        // A sell pushes the price up into the upper range; then a buy, better than the opening price,
-        // runs down out of it and stops in the empty gap.
-        _swapAs(_trader("mover"), key, false, -1_000 ether, TickMath.getSqrtPriceAtTick(1500));
-        _swapAs(_trader("buyer"), key, true, -1_000 ether, TickMath.getSqrtPriceAtTick(900));
-        assertEq(StateLibrary.getLiquidity(manager, key.toId()), 0, "the swap ended with no liquidity in range");
-        assertGt(token.balanceOf(buybacks), 0, "the withheld INFERA went to the buybacks recipient");
-        assertEq(token.balanceOf(address(gapped)), 0);
-    }
-
-    function test_withNoLiquidityInRange_withheldEthAccruesToBuybacks() public {
-        (InferaEthHook gapped, PoolKey memory key) = _gappedPool(-1800, -1200);
-        _swapAs(_trader("mover"), key, true, -1_000 ether, TickMath.getSqrtPriceAtTick(-1500));
-        uint256[4] memory before;
-        for (uint256 i; i < 4; ++i) {
-            before[i] = gapped.accrued(i);
-        }
-        _swapAs(_trader("seller"), key, false, -1_000 ether, TickMath.getSqrtPriceAtTick(-900));
-        assertEq(StateLibrary.getLiquidity(manager, key.toId()), 0);
-        uint256 buybacksGain = gapped.accrued(BUYBACKS) - before[BUYBACKS];
-        uint256 teamGain = gapped.accrued(TEAM) - before[TEAM];
-        assertGt(buybacksGain, teamGain / 2, "buybacks got its 0.5% plus the withheld ETH");
-        uint256 total;
-        for (uint256 i; i < 4; ++i) {
-            total += gapped.accrued(i);
-        }
-        assertEq(address(gapped).balance, total, "still fully backed");
-    }
-
     // ------------------------------------------------------------ payouts
 
     function test_anyoneCanReleaseAndFundsOnlyGoToTheRecipients() public {
@@ -568,7 +545,7 @@ contract InferaEthHookTest is Test, Deployers {
 
     function test_ownerIsTheConstructorArgumentEvenUnderCreate2FromAContract() public {
         HookFactory factory = new HookFactory();
-        bytes memory args = abi.encode(manager, address(token), uint24(500), int24(10), owner, team, buybacks, compute);
+        bytes memory args = _hookArgs(address(token), 500, 10);
         (uint256 salt, address predicted) =
             HookMiner.find(address(factory), InferaEthConfig.HOOK_FLAGS, type(InferaEthHook).creationCode, args);
         address deployed = factory.deploy(bytes32(salt), args);
@@ -641,11 +618,7 @@ contract InferaEthHookTest is Test, Deployers {
     function test_deployingAtAnAddressWithoutTheExactPermissionBitsReverts() public {
         address wrong = address(uint160(Hooks.BEFORE_SWAP_FLAG) | (uint160(0x5555) << 144));
         vm.expectRevert();
-        deployCodeTo(
-            "InferaEthHook.sol:InferaEthHook",
-            abi.encode(manager, address(token), uint24(3000), int24(60), owner, team, buybacks, compute),
-            wrong
-        );
+        deployCodeTo("InferaEthHook.sol:InferaEthHook", _hookArgs(address(token), 3000, 60), wrong);
     }
 
     function test_constantsMatchProgrammablesEthereumRequirement() public view {
@@ -716,7 +689,7 @@ contract InferaEthHookTest is Test, Deployers {
     function _whale() internal returns (address whale) {
         whale = makeAddr("whale");
         vm.deal(whale, 1e30);
-        token.mint(whale, 1e30);
+        token.transfer(whale, 1e28);
         vm.prank(whale);
         token.approve(address(swapRouter), type(uint256).max);
     }
@@ -756,7 +729,10 @@ contract InferaEthHookTest is Test, Deployers {
     function test_zeroAmountSwapsRevert_andOneWeiSwapsStayConsistent() public {
         vm.expectRevert();
         _swap(true, 0, 0);
+        // 1 wei cannot even cover Programmable's rounded-up 0.3%, so it is no trade.
+        vm.expectRevert();
         _swap(true, -1, 1);
+        _swap(true, -100, 100);
         _swap(true, 1, 10);
         _swap(false, -1, 0);
         _swap(false, 1, 0);
@@ -834,16 +810,12 @@ contract InferaEthHookTest is Test, Deployers {
     }
 
     function test_aTaxedTokenFailsSafely() public {
-        TaxableToken taxed = new TaxableToken();
+        TaxableToken taxed = new TaxableToken(address(this), address(manager));
         taxed.mint(address(this), 1_000_000 ether);
         taxed.approve(address(swapRouter), type(uint256).max);
         taxed.approve(address(modifyLiquidityRouter), type(uint256).max);
         address at = address(uint160(InferaEthConfig.HOOK_FLAGS) | (uint160(0x7777) << 144));
-        deployCodeTo(
-            "InferaEthHook.sol:InferaEthHook",
-            abi.encode(manager, address(taxed), uint24(3000), int24(60), owner, team, buybacks, compute),
-            at
-        );
+        deployCodeTo("InferaEthHook.sol:InferaEthHook", _hookArgs(address(taxed), 3000, 60), at);
         InferaEthHook taxedHook = InferaEthHook(payable(at));
         PoolKey memory key = taxedHook.poolKey();
         manager.initialize(key, SQRT_PRICE_1_1);
@@ -887,28 +859,32 @@ contract InferaEthHookTest is Test, Deployers {
         vm.chainId(1);
         address at = address(uint160(InferaEthConfig.HOOK_FLAGS) | (uint160(0x8888) << 144));
         vm.expectRevert(InferaEthHook.WrongPoolManager.selector);
-        deployCodeTo(
-            "InferaEthHook.sol:InferaEthHook",
-            abi.encode(manager, address(token), uint24(3000), int24(60), owner, team, buybacks, compute),
-            at
-        );
+        deployCodeTo("InferaEthHook.sol:InferaEthHook", _hookArgs(address(token), 3000, 60), at);
     }
 
-    /// Known behaviour: an exact-input buy whose own price limit stops it early still pays fees on
-    /// the full amount specified. v4 only lets a hook take the specified currency (ETH here) in
-    /// beforeSwap, before the fill size is known. Routers normally set no binding limit.
-    function test_partialFillAtAPriceLimit_paysFeesOnTheAmountSpecified_knownBehaviour() public {
-        uint160 limit = TickMath.getSqrtPriceAtTick(-600); // about 6% below the opening price
-        uint256 ethBefore = address(this).balance;
+    /// A swap whose ETH side is specified must fill completely: one stopped early by the trader's own
+    /// price limit reverts rather than charge fees on ETH that never reached the pool.
+    function test_partialFillsOfTheSpecifiedEthSideRevert() public {
+        uint160 buyLimit = TickMath.getSqrtPriceAtTick(-600); // about 6% below the opening price
+        vm.expectRevert();
         swapRouter.swap{value: 100 ether}(
             poolKeyEthInfera,
-            SwapParams({zeroForOne: true, amountSpecified: -100 ether, sqrtPriceLimitX96: limit}),
+            SwapParams({zeroForOne: true, amountSpecified: -100 ether, sqrtPriceLimitX96: buyLimit}),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ZERO_BYTES
         );
-        uint256 paid = ethBefore - address(this).balance;
-        assertLt(paid, 100 ether, "the swap stopped at the limit and the unused ETH came back");
-        assertEq(abi.encode(_accrued()), abi.encode(hook.quoteFromGross(100 ether)), "fees on the full 100 ETH");
+        uint160 sellLimit = TickMath.getSqrtPriceAtTick(600);
+        vm.expectRevert();
+        swapRouter.swap(
+            poolKeyEthInfera,
+            SwapParams({zeroForOne: false, amountSpecified: 100 ether, sqrtPriceLimitX96: sellLimit}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ZERO_BYTES
+        );
+        assertEq(_sum(_accrued()), 0, "nothing was charged");
+        // The same buy without a binding limit fills and pays exactly the gross-leg fees.
+        _swap(true, -100 ether, 100 ether);
+        assertEq(abi.encode(_accrued()), abi.encode(hook.quoteFromGross(100 ether)));
         _assertBacked();
     }
 }

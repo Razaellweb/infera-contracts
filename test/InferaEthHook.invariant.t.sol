@@ -11,21 +11,23 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
-import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 import {InferaEthHook} from "../src/InferaEthHook.sol";
 import {InferaEthConfig} from "../src/InferaEthConfig.sol";
+import {InferaToken} from "../src/InferaToken.sol";
+import {InferaLaunchInitializer, IEthUsdFeed} from "../src/InferaLaunchInitializer.sol";
+import {HookArgs, MockEthUsdFeed, ProtectedRouterMock} from "./utils/LaunchFixtures.sol";
 
-/// Random actions against the real pool: all four swap shapes, new blocks, just-in-time liquidity,
-/// payouts and recipient changes. Reverting actions (e.g. an exact-output larger than the pool) are
-/// caught, so every sequence keeps going.
+/// Random actions against the real pool after launch protection: all four swap shapes, new blocks,
+/// just-in-time liquidity, payouts and recipient changes. Reverting actions (e.g. an exact-output
+/// larger than the pool) are caught, so every sequence keeps going.
 contract HookHandler is Test {
     using PoolIdLibrary for PoolKey;
 
     IPoolManager internal immutable manager;
     PoolSwapTest internal immutable swapRouter;
     PoolModifyLiquidityTest internal immutable lpRouter;
-    MockERC20 internal immutable token;
+    InferaToken internal immutable token;
     InferaEthHook internal immutable hook;
     address internal immutable owner;
     PoolKey internal key;
@@ -38,7 +40,7 @@ contract HookHandler is Test {
         IPoolManager manager_,
         PoolSwapTest swapRouter_,
         PoolModifyLiquidityTest lpRouter_,
-        MockERC20 token_,
+        InferaToken token_,
         InferaEthHook hook_,
         address owner_
     ) {
@@ -134,23 +136,25 @@ contract InferaEthHookInvariantTest is Test, Deployers {
 
     function setUp() public {
         deployFreshManagerAndRouters();
-        MockERC20 token = new MockERC20("Infera", "INFERA", 18);
-        token.mint(address(this), 1_000_000 ether);
+        ProtectedRouterMock protectedRouter = new ProtectedRouterMock(manager);
+        // This test contract plays the launch initializer: it seeds the pool, then starts trading.
+        InferaToken token = new InferaToken("Infera", "INFERA", 1e30, address(this), address(manager));
         token.approve(address(modifyLiquidityRouter), type(uint256).max);
         vm.deal(address(this), 10_000 ether);
 
         address at = address(uint160(InferaEthConfig.HOOK_FLAGS) | (uint160(0x4444) << 144));
         deployCodeTo(
             "InferaEthHook.sol:InferaEthHook",
-            abi.encode(
+            HookArgs.encode(
                 manager,
                 address(token),
-                uint24(3000),
-                int24(60),
+                3000,
+                60,
                 makeAddr("owner"),
-                makeAddr("team"),
-                makeAddr("buybacks"),
-                makeAddr("compute")
+                [makeAddr("team"), makeAddr("buybacks"), makeAddr("compute")],
+                address(this),
+                makeAddr("developer"),
+                address(protectedRouter)
             ),
             at
         );
@@ -167,10 +171,12 @@ contract InferaEthHookInvariantTest is Test, Deployers {
             }),
             ZERO_BYTES
         );
+        token.start();
+        vm.warp(block.timestamp + 300); // past launch protection: normal trading
 
         handler = new HookHandler(manager, swapRouter, modifyLiquidityRouter, token, hook, makeAddr("owner"));
         vm.deal(address(handler), 1_000_000 ether);
-        token.mint(address(handler), 1_000_000 ether);
+        token.transfer(address(handler), 1_000_000 ether);
         targetContract(address(handler));
     }
 
@@ -183,13 +189,13 @@ contract InferaEthHookInvariantTest is Test, Deployers {
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 64
     function invariant_hookEthEqualsWhatItOwes() public view {
-        assertEq(address(hook).balance, _sumAccrued());
+        assertEq(address(hook).balance, _sumAccrued() + hook.openingTaxAccrued());
     }
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 64
     function invariant_hookNeverKeepsInfera() public view {
-        assertEq(MockERC20(hook.infera()).balanceOf(address(hook)), 0);
+        assertEq(InferaToken(hook.infera()).balanceOf(address(hook)), 0);
     }
 
     /// forge-config: default.invariant.runs = 64
@@ -209,5 +215,166 @@ contract InferaEthHookInvariantTest is Test, Deployers {
         // 30 wei of slack per swap in this ratio.
         uint256 fees = hook.collected(0) + hook.collected(1) + hook.collected(2) + hook.collected(3);
         assertGe(hook.collected(3) * 230 + 30 * handler.swaps(), fees * 30);
+    }
+}
+
+/// Random actions during and around launch protection: buyers buying through the router (exact
+/// input and output), selling, time moving across the 30-second and 300-second marks, payouts.
+contract ProtectionHandler is Test {
+    IPoolManager internal immutable manager;
+    PoolSwapTest internal immutable swapRouter;
+    ProtectedRouterMock internal immutable router;
+    InferaToken internal immutable token;
+    InferaEthHook internal immutable hook;
+    PoolKey internal key;
+    address[4] public buyers;
+
+    uint256 public taxAfterOpening;
+    bool public openingOver;
+
+    constructor(
+        IPoolManager manager_,
+        PoolSwapTest swapRouter_,
+        ProtectedRouterMock router_,
+        InferaToken token_,
+        InferaEthHook hook_,
+        address[4] memory buyers_
+    ) {
+        manager = manager_;
+        swapRouter = swapRouter_;
+        router = router_;
+        token = token_;
+        hook = hook_;
+        key = hook_.poolKey();
+        buyers = buyers_;
+        for (uint256 i; i < 4; ++i) {
+            vm.deal(buyers_[i], 1_000 ether);
+            vm.startPrank(buyers_[i]);
+            token_.approve(address(swapRouter_), type(uint256).max);
+            vm.stopPrank();
+        }
+    }
+
+    /// Records the opening tax collected once 30 seconds have passed: it must never grow after.
+    modifier observeOpening() {
+        if (!openingOver && block.timestamp >= token.startedAt() + 30) {
+            openingOver = true;
+            taxAfterOpening = hook.openingTaxCollected();
+        }
+        _;
+    }
+
+    function buy(uint256 who, uint256 amount, bool exactOut) external observeOpening {
+        address buyer = buyers[who % 4];
+        router.setMsgSender(buyer);
+        int256 specified =
+            exactOut ? int256(bound(amount, 1e15, 25_000_000 ether)) : -int256(bound(amount, 1e9, 0.5 ether));
+        vm.prank(buyer);
+        try router.swap{value: 1 ether}(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: specified, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        ) {}
+            catch {}
+    }
+
+    function sell(uint256 who, uint256 fraction) external observeOpening {
+        address seller = buyers[who % 4];
+        uint256 amount = token.balanceOf(seller) * bound(fraction, 1, 100) / 100;
+        if (amount == 0) return;
+        vm.prank(seller);
+        try swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: false, amountSpecified: -int256(amount), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        ) {}
+            catch {}
+    }
+
+    function wait(uint256 secondsToWait) external observeOpening {
+        vm.warp(block.timestamp + bound(secondsToWait, 1, 40));
+        vm.roll(block.number + 1);
+    }
+
+    function releaseAll() external observeOpening {
+        hook.releaseAll();
+    }
+}
+
+contract InferaLaunchProtectionInvariantTest is Test, Deployers {
+    address constant PROGRAMMABLE = 0xD88539d3c4C460136a733A3Fd60cf6BF269079da;
+    InferaEthHook hook;
+    InferaToken token;
+    ProtectionHandler handler;
+    address[4] buyers;
+
+    function setUp() public {
+        vm.warp(1_794_400_000);
+        deployFreshManagerAndRouters();
+        vm.deal(address(manager), 55_000 ether); // Mainnet-like native ETH in the PoolManager
+        MockEthUsdFeed feed = new MockEthUsdFeed(205_776_678_409);
+        ProtectedRouterMock router = new ProtectedRouterMock(manager);
+        address launcher = makeAddr("graphFactory");
+        address developer = makeAddr("launchWallet");
+        InferaLaunchInitializer initializer =
+            new InferaLaunchInitializer(manager, launcher, IEthUsdFeed(address(feed)), address(feed).codehash);
+        token = new InferaToken("Infera", "INFERA", 1_000_000_000 ether, address(initializer), address(manager));
+        address at = address(uint160(InferaEthConfig.HOOK_FLAGS) | (uint160(0x4444) << 144));
+        deployCodeTo(
+            "InferaEthHook.sol:InferaEthHook",
+            HookArgs.encode(
+                manager,
+                address(token),
+                3000,
+                60,
+                developer,
+                [makeAddr("team"), makeAddr("buybacks"), makeAddr("compute")],
+                address(initializer),
+                developer,
+                address(router)
+            ),
+            at
+        );
+        hook = InferaEthHook(payable(at));
+        vm.deal(launcher, 1 ether);
+        vm.prank(launcher);
+        initializer.initialize{value: 4_859_637_193_736_836}(hook, address(token), 187_320, developer, 1);
+
+        buyers = [makeAddr("buyer0"), makeAddr("buyer1"), makeAddr("buyer2"), developer];
+        handler = new ProtectionHandler(manager, swapRouter, router, token, hook, buyers);
+        targetContract(address(handler));
+    }
+
+    /// forge-config: default.invariant.runs = 64
+    /// forge-config: default.invariant.depth = 48
+    function invariant_feesAndOpeningTaxAreBacked() public view {
+        uint256 owed = hook.openingTaxAccrued();
+        for (uint256 i; i < 4; ++i) {
+            owed += hook.accrued(i);
+        }
+        assertEq(address(hook).balance, owed);
+        assertEq(hook.openingTaxCollected(), hook.openingTaxAccrued() + hook.openingTaxReleased());
+    }
+
+    /// forge-config: default.invariant.runs = 64
+    /// forge-config: default.invariant.depth = 48
+    function invariant_noBuyerBuysAndNoAddressReceivesMoreThan2Percent() public view {
+        uint256 limit = token.walletTokenLimit();
+        for (uint256 i; i < 4; ++i) {
+            assertLe(hook.boughtDuringProtection(buyers[i]), limit);
+            assertLe(token.receivedDuringProtection(buyers[i]), limit);
+        }
+    }
+
+    /// forge-config: default.invariant.runs = 64
+    /// forge-config: default.invariant.depth = 48
+    function invariant_theOpeningTaxStopsAfter30SecondsAndOnlyReachesProgrammable() public view {
+        if (handler.openingOver()) assertEq(hook.openingTaxCollected(), handler.taxAfterOpening());
+        // Programmable's treasury receives exactly its 0.3% bucket and the opening tax, nothing else.
+        assertEq(PROGRAMMABLE.balance, hook.released(3) + hook.openingTaxReleased());
     }
 }

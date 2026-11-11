@@ -18,6 +18,19 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 
+/// @notice The launch-protection surface of the INFERA token.
+interface IInferaLaunchToken {
+    function initializer() external view returns (address);
+    function poolManager() external view returns (address);
+    function startedAt() external view returns (uint256);
+    function walletTokenLimit() external view returns (uint256);
+}
+
+/// @notice The router that identifies its caller (the buyer) while it swaps.
+interface ILaunchProtectionRouter {
+    function msgSender() external view returns (address);
+}
+
 /// @title InferaEthHook
 /// @notice Uniswap v4 hook for the native ETH / INFERA pool launched through Programmable.
 ///
@@ -47,6 +60,17 @@ import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 /// anchor). A later swap in the same block is held to the anchor when earlier swaps moved the price in
 /// its favour. Attacks spread over several blocks are not covered.
 ///
+/// Launch protection (Programmable's required rules for new Ethereum launches), counted from the
+/// token's {IInferaLaunchToken.startedAt}:
+///   - First 300 seconds: buys must come through the canonical Universal Router, which identifies
+///     the buyer, or be the launch initializer's first buy (the developer's). Each buyer can buy at
+///     most 2% of the supply in total; selling never restores it, and no buyer is exempt.
+///   - First 30 seconds: buys pay an opening tax on top of the normal 2.3%, so the total buy fee
+///     starts at 99% and falls linearly to 2.3%. The developer and up to six fixed wallets are exempt
+///     from the opening tax only. The tax is held in this contract and payable only to Programmable.
+/// A swap whose ETH side is specified (exact-input buy, exact-output sell) must fill completely;
+/// a fill stopped early by the trader's price limit reverts rather than charge fees on unfilled ETH.
+///
 /// Owner controls (disclose for review): change the team / buybacks / compute recipients, and
 /// transfer ownership (two-step). The owner cannot touch rates, Programmable's share or its
 /// recipient, or accrued Programmable fees.
@@ -66,6 +90,20 @@ contract InferaEthHook is IHooks {
     address public constant PROGRAMMABLE_RECIPIENT = 0xD88539d3c4C460136a733A3Fd60cf6BF269079da;
     /// @notice The canonical Uniswap v4 PoolManager on Ethereum Mainnet, enforced there by the constructor.
     address public constant MAINNET_POOL_MANAGER = 0x000000000004444c5dc75cB358380D2e3dE08A90;
+    /// @notice The canonical Universal Router on Ethereum Mainnet, and its runtime code hash.
+    address public constant MAINNET_ROUTER = 0xd92A36B0000531EF3063dEd4De20A0783308446C;
+    bytes32 public constant MAINNET_ROUTER_CODE_HASH =
+        0x41ccd905c8e4de29ce9536ff49233b79e3085a0987d490664e703ee1e7b1dc49;
+
+    /// @notice Buyer limits and router-only buys last this long after trading starts.
+    uint256 public constant PROTECTION_SECONDS = 300;
+    /// @notice The opening tax decays to zero over this long after trading starts.
+    uint256 public constant DECAY_SECONDS = 30;
+    /// @notice Total buy fee at the opening instant: 99%, in parts per million.
+    uint256 public constant OPENING_TOTAL_PPM = 990_000;
+    /// @notice The normal total buy fee in parts per million: 2.3%.
+    uint256 public constant NORMAL_PPM = TOTAL_BPS * 100;
+    uint256 private constant PPM = 1_000_000;
 
     enum Bucket {
         Team, // 1.0% of gross (half of Infera's 2%)
@@ -80,6 +118,15 @@ contract InferaEthHook is IHooks {
     address public immutable infera;
     uint24 public immutable lpFee;
     int24 public immutable tickSpacing;
+    /// @notice The launch initializer; its swap is the developer's first buy.
+    address public immutable initializer;
+    /// @notice The developer (the launch wallet): exempt from the opening tax, not from the buy limit.
+    address public immutable developer;
+    /// @notice The only router buyers can use during the protection window, and its code hash.
+    address public immutable router;
+    bytes32 public immutable routerCodeHash;
+    /// @dev Up to six more wallets exempt from the opening tax; zero entries are unused.
+    address[6] private _exemptWallets;
 
     address public owner;
     address public pendingOwner;
@@ -87,7 +134,8 @@ contract InferaEthHook is IHooks {
     address public buybacksRecipient;
     address public computeRecipient;
 
-    /// @notice ETH accrued and not yet released, per bucket. Always sums to this contract's balance.
+    /// @notice ETH accrued and not yet released, per bucket. With {openingTaxAccrued}, always sums to
+    ///         this contract's balance.
     uint256[4] public accrued;
     /// @notice Lifetime trading fees collected, per bucket (fees only; see {withheldEth}).
     uint256[4] public collected;
@@ -98,6 +146,20 @@ contract InferaEthHook is IHooks {
     uint256 public withheldEth;
     /// @notice Lifetime INFERA withheld by same-block price enforcement, sent to the buybacks recipient.
     uint256 public withheldInfera;
+
+    /// @notice Opening tax held for Programmable and not yet released. The hook's ETH balance always
+    ///         equals the four buckets' `accrued` plus this.
+    uint256 public openingTaxAccrued;
+    /// @notice Lifetime opening tax collected, and released to Programmable.
+    uint256 public openingTaxCollected;
+    uint256 public openingTaxReleased;
+    /// @notice INFERA each buyer has bought during the protection window.
+    mapping(address buyer => uint256 amount) public boughtDuringProtection;
+
+    /// @dev Set in beforeSwap, consumed and cleared in afterSwap of the same swap.
+    address private _activeBuyer;
+    uint256 private _activeTaxPpm;
+    uint256 private _expectedPoolEth;
 
     /// @notice The pool price when the current (or last) block's first swap began.
     struct BlockStart {
@@ -111,6 +173,23 @@ contract InferaEthHook is IHooks {
     uint256 private _locked = 1;
     uint256 private constant MAX_HOOK_DELTA = 2 ** 127 - 1; // type(int128).max
 
+    /// @notice Who owns the hook and receives Infera's fees.
+    struct Recipients {
+        address owner;
+        address team;
+        address buybacks;
+        address compute;
+    }
+
+    /// @notice The launch-protection parties.
+    struct Protection {
+        address initializer;
+        address developer;
+        address router;
+        bytes32 routerCodeHash;
+        address[6] exemptWallets;
+    }
+
     // ---------------------------------------------------------------- events
 
     event FeesCharged(
@@ -122,6 +201,8 @@ contract InferaEthHook is IHooks {
     /// @notice A swap would have beaten its block's opening price; `amount` (in ETH if `eth`, else
     ///         INFERA) was withheld for the buybacks recipient.
     event BlockStartPriceEnforced(bool indexed buy, bool eth, uint256 amount, address indexed recipient);
+    event OpeningTaxCharged(address indexed buyer, uint256 grossEth, uint256 amount);
+    event OpeningTaxReleased(uint256 amount);
     event RecipientUpdated(Bucket indexed bucket, address previous, address current);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
@@ -140,6 +221,12 @@ contract InferaEthHook is IHooks {
     error Reentrancy();
     error UnexpectedEther();
     error FeeOverflow();
+    error InvalidConfiguration();
+    error UnsupportedRouter();
+    error InvalidBuyer();
+    error BuyerLimitExceeded(address buyer, uint256 attempted, uint256 limit);
+    error PartialFillUnsupported(uint256 expected, uint256 actual);
+    error NoTrade();
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -159,27 +246,31 @@ contract InferaEthHook is IHooks {
     }
 
     /// @param manager_ The Uniswap v4 PoolManager (Ethereum Mainnet: 0x000000000004444c5dc75cB358380D2e3dE08A90).
-    /// @param infera_ The INFERA token.
+    /// @param infera_ The INFERA token; its initializer and PoolManager must match.
     /// @param lpFee_ The pool's static LP fee, in pips (e.g. 3000 = 0.3%).
     /// @param tickSpacing_ The pool's tick spacing.
-    /// @param owner_ The owner, passed explicitly: under CREATE2 (a deployer proxy or Programmable's
-    ///        router) `msg.sender` is not the deploying wallet.
+    /// @param recipients_ The owner, passed explicitly (under CREATE2 `msg.sender` is the factory), and
+    ///        the team / buybacks / compute recipients.
+    /// @param protection_ The launch initializer, the developer, the router buyers must use during the
+    ///        protection window (the canonical Universal Router on Mainnet) and its code hash, and up
+    ///        to six more opening-tax-exempt wallets.
     constructor(
         IPoolManager manager_,
         address infera_,
         uint24 lpFee_,
         int24 tickSpacing_,
-        address owner_,
-        address team_,
-        address buybacks_,
-        address compute_
+        Recipients memory recipients_,
+        Protection memory protection_
     ) {
         if (
-            address(manager_) == address(0) || infera_ == address(0) || owner_ == address(0) || team_ == address(0)
-                || buybacks_ == address(0) || compute_ == address(0)
+            address(manager_) == address(0) || infera_ == address(0) || recipients_.owner == address(0)
+                || recipients_.team == address(0) || recipients_.buybacks == address(0)
+                || recipients_.compute == address(0) || protection_.initializer == address(0)
+                || protection_.developer == address(0)
         ) revert ZeroAddress();
         // On Ethereum Mainnet, only the canonical Uniswap v4 PoolManager.
         if (block.chainid == 1 && address(manager_) != MAINNET_POOL_MANAGER) revert WrongPoolManager();
+        _validateProtection(manager_, infera_, protection_);
         // Reverts unless this contract's address carries exactly the permission bits below.
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
 
@@ -187,15 +278,42 @@ contract InferaEthHook is IHooks {
         infera = infera_;
         lpFee = lpFee_;
         tickSpacing = tickSpacing_;
+        initializer = protection_.initializer;
+        developer = protection_.developer;
+        router = protection_.router;
+        routerCodeHash = protection_.routerCodeHash;
+        _exemptWallets = protection_.exemptWallets;
 
-        owner = owner_;
-        teamRecipient = team_;
-        buybacksRecipient = buybacks_;
-        computeRecipient = compute_;
-        emit OwnershipTransferred(address(0), owner_);
-        emit RecipientUpdated(Bucket.Team, address(0), team_);
-        emit RecipientUpdated(Bucket.Buybacks, address(0), buybacks_);
-        emit RecipientUpdated(Bucket.Compute, address(0), compute_);
+        owner = recipients_.owner;
+        teamRecipient = recipients_.team;
+        buybacksRecipient = recipients_.buybacks;
+        computeRecipient = recipients_.compute;
+        emit OwnershipTransferred(address(0), recipients_.owner);
+        emit RecipientUpdated(Bucket.Team, address(0), recipients_.team);
+        emit RecipientUpdated(Bucket.Buybacks, address(0), recipients_.buybacks);
+        emit RecipientUpdated(Bucket.Compute, address(0), recipients_.compute);
+    }
+
+    function _validateProtection(IPoolManager manager_, address infera_, Protection memory p) private view {
+        if (
+            IInferaLaunchToken(infera_).initializer() != p.initializer
+                || IInferaLaunchToken(infera_).poolManager() != address(manager_) || p.developer == infera_
+                || p.developer == address(manager_) || p.router.code.length == 0
+                || p.router.codehash != p.routerCodeHash
+                || (block.chainid == 1 && (p.router != MAINNET_ROUTER || p.routerCodeHash != MAINNET_ROUTER_CODE_HASH))
+        ) revert InvalidConfiguration();
+        // forge-lint: disable-next-item(require-revert-in-loop) constructor configuration check over six slots
+        for (uint256 i = 0; i < 6; ++i) {
+            address wallet = p.exemptWallets[i];
+            if (wallet == address(0)) continue;
+            if (
+                wallet == p.developer || wallet == address(this) || wallet == infera_ || wallet == address(manager_)
+                    || wallet == p.router || wallet == p.initializer
+            ) revert InvalidConfiguration();
+            for (uint256 j = 0; j < i; ++j) {
+                if (wallet == p.exemptWallets[j]) revert InvalidConfiguration();
+            }
+        }
     }
 
     /// @notice The id of the only pool this hook serves. Computed rather than stored, so every value
@@ -255,6 +373,69 @@ contract InferaEthHook is IHooks {
         fees = _split(total - programmableFee, programmableFee);
     }
 
+    /// @notice Fees for a buy that also pays an opening tax of `taxPpm` (parts per million of its gross
+    ///         ETH leg). With `amountIsNet` the amount excludes all fees (exact-output buys). With no
+    ///         tax this is exactly {quoteFromGross} / {quoteFromNet}.
+    function quoteBuy(uint256 amount, bool amountIsNet, uint256 taxPpm)
+        public
+        pure
+        returns (uint256[4] memory fees, uint256 openingTax, uint256 gross)
+    {
+        if (taxPpm == 0) {
+            if (amountIsNet) (fees, gross) = quoteFromNet(amount);
+            else (fees, gross) = (quoteFromGross(amount), amount);
+            return (fees, 0, gross);
+        }
+        uint256 totalPpm = NORMAL_PPM + taxPpm; // at most OPENING_TOTAL_PPM, below 100%
+        uint256 total;
+        if (amountIsNet) {
+            gross = FullMath.mulDivRoundingUp(amount, PPM, PPM - totalPpm);
+            total = gross - amount;
+        } else {
+            gross = amount;
+            total = FullMath.mulDivRoundingUp(gross, totalPpm, PPM);
+            if (total > gross) total = gross;
+        }
+        // The normal fees come first, at their usual rates; the opening tax is the rest.
+        uint256 programmableFee = _ceilDiv(gross * PROGRAMMABLE_BPS, BPS);
+        if (programmableFee > total) programmableFee = total;
+        uint256 inferaFee = gross * INFERA_BPS / BPS;
+        if (inferaFee > total - programmableFee) inferaFee = total - programmableFee;
+        fees = _split(inferaFee, programmableFee);
+        openingTax = total - programmableFee - inferaFee;
+    }
+
+    /// @notice The opening tax, in parts per million, a buy by `buyer` pays right now.
+    function openingTaxPpm(address buyer) public view returns (uint256) {
+        uint256 startedAt = IInferaLaunchToken(infera).startedAt();
+        // forge-lint: disable-next-line(block-timestamp) the opening tax decays over seconds, as Programmable requires
+        if (startedAt == 0 || block.timestamp >= startedAt + DECAY_SECONDS || isOpeningTaxExempt(buyer)) return 0;
+        return
+            FullMath.mulDiv(OPENING_TOTAL_PPM - NORMAL_PPM, startedAt + DECAY_SECONDS - block.timestamp, DECAY_SECONDS);
+    }
+
+    /// @notice Whether `wallet` is exempt from the opening tax (the developer and the six fixed wallets).
+    function isOpeningTaxExempt(address wallet) public view returns (bool) {
+        if (wallet == address(0)) return false;
+        if (wallet == developer) return true;
+        for (uint256 i = 0; i < 6; ++i) {
+            if (wallet == _exemptWallets[i]) return true;
+        }
+        return false;
+    }
+
+    /// @notice The up to six wallets exempt from the opening tax besides the developer.
+    function exemptWallets() external view returns (address[6] memory) {
+        return _exemptWallets;
+    }
+
+    /// @notice Whether buyer limits and router-only buys are in force.
+    function protectionActive() public view returns (bool) {
+        uint256 startedAt = IInferaLaunchToken(infera).startedAt();
+        // forge-lint: disable-next-line(block-timestamp) the protection window is defined in seconds
+        return startedAt != 0 && block.timestamp < startedAt + PROTECTION_SECONDS;
+    }
+
     function _split(uint256 inferaFee, uint256 programmableFee) private pure returns (uint256[4] memory fees) {
         fees[uint256(Bucket.Team)] = inferaFee / 2; // 100 of 200 bps
         fees[uint256(Bucket.Buybacks)] = inferaFee / 4; // 50 of 200 bps
@@ -270,18 +451,20 @@ contract InferaEthHook is IHooks {
 
     /// @dev Anchors the block-start price, then, when ETH is the specified currency (exact-input
     ///      buy, exact-output sell), charges the fees by returning a positive specified delta.
-    function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+    function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         override
         onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
+        if (params.amountSpecified == 0) revert NoTrade();
         // The only pool this hook serves: native ETH (currency0) / INFERA (currency1) at this fee and spacing.
         if (
             !key.currency0.isAddressZero() || Currency.unwrap(key.currency1) != infera || key.fee != lpFee
                 || key.tickSpacing != tickSpacing || address(key.hooks) != address(this)
         ) revert NotBoundPool();
         _anchorBlockStartPrice(key.toId());
+        if (params.zeroForOne) _identifyBuyer(sender);
         if (!_ethIsSpecified(params)) return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
 
         uint256 total;
@@ -289,12 +472,16 @@ contract InferaEthHook is IHooks {
             // Exact-input buy: the trader pays exactly |amountSpecified| ETH, which is the gross leg.
             // forge-lint: disable-next-line(unsafe-typecast) amountSpecified < 0, so the negation is positive
             uint256 gross = uint256(-params.amountSpecified);
-            total = _accrueFees(true, gross, quoteFromGross(gross));
+            (uint256[4] memory fees, uint256 openingTax,) = quoteBuy(gross, false, _activeTaxPpm);
+            total = _accrueFees(true, gross, fees) + _accrueOpeningTax(_activeBuyer, gross, openingTax);
+            if (total >= gross) revert NoTrade();
+            _expectedPoolEth = gross - total;
         } else {
             // Exact-output sell: the trader receives exactly amountSpecified ETH; the pool pays out the fees on top.
             // forge-lint: disable-next-line(unsafe-typecast) amountSpecified >= 0 in this branch
             (uint256[4] memory fees, uint256 gross) = quoteFromNet(uint256(params.amountSpecified));
             total = _accrueFees(false, gross, fees);
+            _expectedPoolEth = gross;
         }
         _takeEth(total);
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(_toInt128(total), 0), 0);
@@ -311,32 +498,95 @@ contract InferaEthHook is IHooks {
         returns (bytes4, int128)
     {
         // beforeSwap already rejected any other pool for this swap and anchored the price.
-        uint256 unspecifiedTake = params.zeroForOne
-            ? _afterBuy(params.amountSpecified < 0, delta)
-            : _afterSell(params.amountSpecified < 0, delta);
+        if (_ethIsSpecified(params)) {
+            uint256 poolEth = params.zeroForOne ? _paidIn(delta.amount0()) : _received(delta.amount0());
+            if (poolEth != _expectedPoolEth) revert PartialFillUnsupported(_expectedPoolEth, poolEth);
+        }
+        // Clear this swap's state before any external call.
+        address buyer = _activeBuyer;
+        uint256 taxPpm = _activeTaxPpm;
+        _activeBuyer = address(0);
+        _activeTaxPpm = 0;
+        _expectedPoolEth = 0;
+
+        uint256 unspecifiedTake;
+        if (params.zeroForOne) {
+            (uint256 take, uint256 bought, bool takeIsEth) = _afterBuy(params.amountSpecified < 0, delta, buyer, taxPpm);
+            _countPurchase(buyer, bought);
+            if (takeIsEth) _takeEth(take);
+            else _sendWithheldInfera(take);
+            unspecifiedTake = take;
+        } else {
+            unspecifiedTake = _afterSell(params.amountSpecified < 0, delta);
+        }
         return (IHooks.afterSwap.selector, _toInt128(unspecifiedTake));
     }
 
+    // ---------------------------------------------------------------- launch protection
+
+    /// @dev For a buy: during the protection window, works out who is buying (the developer for the
+    ///      initializer's first buy, otherwise the canonical router's caller) and records them for
+    ///      the 2% limit; during the first 30 seconds, also the opening tax they pay.
+    function _identifyBuyer(address sender) private {
+        if (!protectionActive()) return;
+        address buyer;
+        if (sender == initializer) {
+            buyer = developer;
+        } else {
+            if (sender != router || sender.codehash != routerCodeHash) revert UnsupportedRouter();
+            buyer = ILaunchProtectionRouter(sender).msgSender();
+            if (buyer == address(0) || buyer == router || buyer == address(this) || buyer == address(poolManager)) {
+                revert InvalidBuyer();
+            }
+        }
+        _activeBuyer = buyer;
+        _activeTaxPpm = openingTaxPpm(buyer);
+    }
+
+    /// @dev Adds a buy to its buyer's protection-window total; reverts the swap past 2% of supply.
+    function _countPurchase(address buyer, uint256 bought) private {
+        if (buyer == address(0)) return;
+        uint256 total = boughtDuringProtection[buyer] + bought;
+        uint256 limit = IInferaLaunchToken(infera).walletTokenLimit();
+        if (total > limit) revert BuyerLimitExceeded(buyer, total, limit);
+        boughtDuringProtection[buyer] = total;
+    }
+
+    /// @dev Books an opening tax for Programmable. State only; the ETH is taken with the fees.
+    function _accrueOpeningTax(address buyer, uint256 gross, uint256 amount) private returns (uint256) {
+        if (amount == 0) return 0;
+        openingTaxAccrued += amount;
+        openingTaxCollected += amount;
+        emit OpeningTaxCharged(buyer, gross, amount);
+        return amount;
+    }
+
     /// @dev Buy: ETH in, INFERA out. Returns what the hook takes of the unspecified currency.
-    function _afterBuy(bool exactInput, BalanceDelta delta) private returns (uint256 take) {
+    ///      Also returns the INFERA the buyer actually receives. State only: the caller moves `take`
+    ///      (ETH taken into the hook, or withheld INFERA sent to buybacks) after counting the purchase.
+    function _afterBuy(bool exactInput, BalanceDelta delta, address buyer, uint256 taxPpm)
+        private
+        returns (uint256 take, uint256 bought, bool takeIsEth)
+    {
         uint256 ethIn = _paidIn(delta.amount0());
         uint256 inferaOut = _received(delta.amount1());
+        if (inferaOut == 0) revert NoTrade();
         if (exactInput) {
             // INFERA out is unspecified: no more than ethIn buys at the block-start price.
             uint256 maxOut = _inferaWorth(ethIn, blockStart.sqrtPriceX96, true);
             take = inferaOut > maxOut ? inferaOut - maxOut : 0;
             _bookExcess(true, false, take);
-            _sendWithheldInfera(take);
+            bought = inferaOut - take;
         } else {
             // ETH in is unspecified: pay at least what inferaOut cost at the block-start price,
-            // and the fees on top of that.
+            // and the fees (and any opening tax) on top of that.
             uint256 minCost = _ethWorth(inferaOut, blockStart.sqrtPriceX96, false);
             uint256 excess = minCost > ethIn ? minCost - ethIn : 0;
-            (uint256[4] memory fees, uint256 gross) = quoteFromNet(ethIn + excess);
+            (uint256[4] memory fees, uint256 openingTax, uint256 gross) = quoteBuy(ethIn + excess, true, taxPpm);
             _bookExcess(true, true, excess);
-            uint256 total = _accrueFees(true, gross, fees);
-            take = excess + total;
-            _takeEth(take);
+            take = excess + _accrueFees(true, gross, fees) + _accrueOpeningTax(buyer, gross, openingTax);
+            bought = inferaOut;
+            takeIsEth = true;
         }
     }
 
@@ -476,9 +726,27 @@ contract InferaEthHook is IHooks {
         if (amount != 0) emit Released(bucket, recipient, amount);
     }
 
-    /// @notice Pays every bucket. Callable by anyone. A recipient that rejects ETH only holds up its
-    ///         own bucket (`ReleaseSkipped`); the others are still paid.
+    /// @notice Pays the held opening tax to Programmable's fixed treasury. Callable by anyone.
+    function releaseOpeningTax() external nonReentrant returns (uint256 amount) {
+        amount = _releaseOpeningTax();
+    }
+
+    /// @dev Effects before the transfer; reverts (keeping the tax held) if the treasury rejects ETH.
+    function _releaseOpeningTax() private returns (uint256 amount) {
+        amount = openingTaxAccrued;
+        if (amount == 0) return 0;
+        openingTaxAccrued = 0;
+        openingTaxReleased += amount;
+        emit OpeningTaxReleased(amount);
+        // forge-lint: disable-next-line(arbitrary-send-eth, reentrancy-eth) fixed Programmable treasury; callers hold the lock
+        (bool ok,) = PROGRAMMABLE_RECIPIENT.call{value: amount}("");
+        if (!ok) revert ReleaseFailed(Bucket.Programmable, PROGRAMMABLE_RECIPIENT, amount);
+    }
+
+    /// @notice Pays every bucket and the held opening tax. Callable by anyone. A recipient that
+    ///         rejects ETH only holds up its own bucket (`ReleaseSkipped`); the others are still paid.
     function releaseAll() external nonReentrant {
+        _releaseOpeningTax();
         for (uint256 i = 0; i < 4; ++i) {
             (uint256 amount, address recipient, bool ok) = _release(Bucket(i));
             if (amount == 0) continue;
