@@ -47,6 +47,8 @@ LAUNCH_WALLET = "0x1F9c16370fAdd58A05D87C685488Ef556d2DE7be"  # signs the launch
 TEAM = "0xBB4dEA1A372EBCA201c1cD140Cd21bC42E33095A"
 BUYBACKS = "0x3835872Ea6EbE568769BabB3ba77147C4789A3FD"
 COMPUTE = "0x4db6dF81fd2aDC898BF3af1D01E518E8ce23F83f"
+# Exempt from the 30-second opening tax besides the launch wallet (at most six; still capped at 2%).
+OPENING_TAX_EXEMPT = ["0xeE076ee798f5E16F3FDaF7607473Ab1DC5Ee865E"]
 NAME, SYMBOL = "Infera", "INFERA"
 SUPPLY = str(1_000_000_000 * 10**18)
 LP_FEE, TICK_SPACING = 3000, 60
@@ -317,8 +319,14 @@ def main():
                     LP_FEE,
                     TICK_SPACING,
                     [LAUNCH_WALLET, TEAM, BUYBACKS, COMPUTE],  # Recipients: owner, team, buybacks, compute
-                    # Protection: initializer, developer, router, router code hash, no extra tax-exempt wallets
-                    [{"target": "initializer"}, LAUNCH_WALLET, UNIVERSAL_ROUTER, UNIVERSAL_ROUTER_CODE_HASH, [ZERO] * 6],
+                    # Protection: initializer, developer, router, router code hash, extra tax-exempt wallets
+                    [
+                        {"target": "initializer"},
+                        LAUNCH_WALLET,
+                        UNIVERSAL_ROUTER,
+                        UNIVERSAL_ROUTER_CODE_HASH,
+                        OPENING_TAX_EXEMPT + [ZERO] * (6 - len(OPENING_TAX_EXEMPT)),
+                    ],
                 ],
                 "initializer": None,
                 "initializerValueWei": "0",

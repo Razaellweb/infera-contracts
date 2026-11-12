@@ -26,6 +26,7 @@ contract InferaLaunchPackageForkTest is Test {
     address constant ROUTER = 0xd92A36B0000531EF3063dEd4De20A0783308446C;
     address constant LAUNCH_WALLET = 0x1F9c16370fAdd58A05D87C685488Ef556d2DE7be;
     address constant PROGRAMMABLE = 0xD88539d3c4C460136a733A3Fd60cf6BF269079da;
+    address constant TAX_EXEMPT = 0xeE076ee798f5E16F3FDaF7607473Ab1DC5Ee865E;
 
     function test_fork_thePackedLaunchRunsOnMainnet() public {
         string memory packPath = "launch/build/pack-result.json";
@@ -63,6 +64,12 @@ contract InferaLaunchPackageForkTest is Test {
         assertEq(InferaEthHook(payable(hook)).owner(), LAUNCH_WALLET);
         assertEq(InferaEthHook(payable(hook)).router(), ROUTER);
         assertEq(InferaLaunchInitializer(initializer).launcher(), GRAPH_FACTORY);
+        assertEq(InferaEthHook(payable(hook)).exemptWallets()[0], TAX_EXEMPT);
+        assertTrue(InferaEthHook(payable(hook)).isOpeningTaxExempt(TAX_EXEMPT));
+        assertTrue(InferaEthHook(payable(hook)).isOpeningTaxExempt(LAUNCH_WALLET));
+        for (uint256 i = 1; i < 6; ++i) {
+            assertEq(InferaEthHook(payable(hook)).exemptWallets()[i], address(0), "no other exemptions");
+        }
 
         // The launch call, as Programmable's graph factory makes it. Keep the live price fresh.
         (,,, uint256 updatedAt,) = InferaLaunchInitializer(initializer).ethUsdFeed().latestRoundData();
@@ -92,6 +99,13 @@ contract InferaLaunchPackageForkTest is Test {
         _universalRouterBuy(InferaEthHook(payable(hook)).poolKey(), alice, 0.01 ether);
         assertGt(InferaToken(token).balanceOf(alice), 0);
         assertGt(InferaEthHook(payable(hook)).openingTaxAccrued(), 0.009 ether, "about 96.7% opening tax");
+        // The exempt wallet buys in the same opening seconds without the opening tax, within its 2%.
+        uint256 taxBefore = InferaEthHook(payable(hook)).openingTaxAccrued();
+        vm.deal(TAX_EXEMPT, 1 ether);
+        _universalRouterBuy(InferaEthHook(payable(hook)).poolKey(), TAX_EXEMPT, 0.01 ether);
+        assertGt(InferaToken(token).balanceOf(TAX_EXEMPT), 0);
+        assertEq(InferaEthHook(payable(hook)).openingTaxAccrued(), taxBefore, "no opening tax for the exempt wallet");
+
         uint256 programmableBefore = PROGRAMMABLE.balance;
         InferaEthHook(payable(hook)).releaseAll();
         assertGt(PROGRAMMABLE.balance, programmableBefore);
