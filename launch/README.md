@@ -19,8 +19,8 @@ programmable-launch pack --config programmable-launch.config.json --output launc
 programmable-launch validate launch.json --config programmable-launch.config.json
 ```
 
-The opening tick is set for `OPENING_FDV_USD` (USD 20,000) at the ETH price passed in, so the launch
-still clears Programmable's USD 15,000 floor if ETH falls up to 25% before it happens. After `pack`,
+The opening tick is set for `OPENING_FDV_USD` (USD 17,000) at the ETH price passed in, so the launch
+still clears Programmable's USD 15,000 floor if ETH falls up to about 11.7% before it happens. After `pack`,
 `forge test --match-path test/InferaLaunchPackage.fork.t.sol --fork-url <rpc>` deploys the exact packed
 targets at their predicted addresses on a Mainnet fork and runs the packed launch call.
 

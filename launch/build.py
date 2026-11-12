@@ -56,7 +56,7 @@ WALLET_TOKEN_LIMIT = str(1_000_000_000 * 10**18 * 200 // 10_000)  # 2% of supply
 # The opening price is set for this valuation at the ETH/USD price given to --eth-usd-8dp. Programmable's
 # floor is USD 15,000 at the moment of launch, checked against the live feed; the margin above it
 # absorbs ETH falling between packing and the launch (review plus the 24-hour signing window).
-OPENING_FDV_USD = 20_000
+OPENING_FDV_USD = 17_000
 FIRST_BUY_USD = 10
 FIRST_BUY_MIN_OUT_BPS = 9_800  # the first buy may return no less than 98% of its estimate
 INFERA_FEE_HUNDREDTHS_OF_BIP = "20000"  # 2% on buys and sells, on top of Programmable's 0.3%

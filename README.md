@@ -128,9 +128,10 @@ transaction, then its graph factory (the initializer's only allowed caller) call
 with the launch wallet's first-buy ETH:
 
 1. The opening price is checked against the live ETH/USD feed: the valuation must be at least
-   USD 15,000. `launch/build.py` sets the opening tick for USD 20,000 at the ETH price when the package
-   is built, so the launch still clears the floor if ETH falls up to 25% before it happens (review plus
-   the 24-hour signing window).
+   USD 15,000. `launch/build.py` sets the opening tick for USD 17,000 at the ETH price when the package
+   is built, so the launch still clears the floor if ETH falls up to about 11.7% before it happens
+   (review plus the 24-hour signing window). A larger fall reverts the launch, which then needs a
+   rebuilt package.
 2. The whole supply goes into one position from the lowest usable price up to the starting price, so
    the pool opens holding only INFERA and buyers' ETH builds the other side.
 3. Trading starts on the token, which opens the protection window.
